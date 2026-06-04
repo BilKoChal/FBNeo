@@ -1454,11 +1454,342 @@ static void VideoBufferInit()
 		memset(pVidImage, 0, nSize);
 }
 
+/* ---- Config-driven auto-load save state (Windows) ------------------- *
+ * On the first frame after a ROM loads, the core reads a config file that
+ * sits next to it and is named after it: e.g. "fbneo_libretro.cfg" beside
+ * "fbneo_libretro.dll". If enabled, it loads:
+ *
+ *     <save_path>\<rom-name-without-extension>.<state_ext>
+ *
+ * Archive content ("game.zip#inner.bin") uses the inner file name.
+ * A line is written to "autoload.log" beside the core for diagnostics.
+ *
+ * NOTE: this file is C++ and lives in a large codebase, so instead of
+ * including <windows.h> (which can clash with FBNeo's own types/macros) we
+ * declare the two Win32 functions we need directly.                       */
+#ifdef _WIN32
+#include <stdio.h>
+#include <stdarg.h>
+#include <string.h>
+
+#ifndef MAX_PATH
+#define MAX_PATH 260
+#endif
+
+#define AUTOLOAD_FROM_ADDRESS        0x00000004
+#define AUTOLOAD_UNCHANGED_REFCOUNT  0x00000002
+
+extern "C" __declspec(dllimport)
+int           __stdcall GetModuleHandleExA(unsigned long dwFlags,
+                                           const char *lpModuleName,
+                                           void **phModule);
+extern "C" __declspec(dllimport)
+unsigned long __stdcall GetModuleFileNameA(void *hModule,
+                                           char *lpFilename,
+                                           unsigned long nSize);
+
+static bool autoload_state_pending      = false;
+static char autoload_dir[MAX_PATH]      = {0};
+static char autoload_rom_path[MAX_PATH] = {0};
+
+static void autoload_get_self_dir(char *out, size_t out_size)
+{
+   void *hm = NULL;
+   char  path[MAX_PATH];
+   char *slash;
+   out[0] = '\0';
+   if (!GetModuleHandleExA(AUTOLOAD_FROM_ADDRESS | AUTOLOAD_UNCHANGED_REFCOUNT,
+                           (const char*)&autoload_get_self_dir, &hm))
+      return;
+   if (!GetModuleFileNameA(hm, path, sizeof(path)))
+      return;
+   slash = strrchr(path, '\\');
+   if (slash) *slash = '\0';
+   strncpy(out, path, out_size - 1);
+   out[out_size - 1] = '\0';
+}
+
+static void autoload_get_self_cfg(char *out, size_t out_size)
+{
+   void *hm = NULL;
+   char  path[MAX_PATH];
+   char *slash, *dot;
+   out[0] = '\0';
+   if (!GetModuleHandleExA(AUTOLOAD_FROM_ADDRESS | AUTOLOAD_UNCHANGED_REFCOUNT,
+                           (const char*)&autoload_get_self_cfg, &hm))
+      return;
+   if (!GetModuleFileNameA(hm, path, sizeof(path)))
+      return;
+   slash = strrchr(path, '\\');
+   dot   = strrchr(path, '.');
+   if (dot && (!slash || dot > slash))
+      *dot = '\0';
+   snprintf(out, out_size, "%s.cfg", path);
+}
+
+static void autoload_logf(const char *fmt, ...)
+{
+   char    line[1024];
+   va_list ap;
+   va_start(ap, fmt);
+   vsnprintf(line, sizeof(line), fmt, ap);
+   va_end(ap);
+
+   if (log_cb)
+      log_cb(RETRO_LOG_INFO, "[autoload] %s\n", line);
+
+   if (autoload_dir[0] != '\0')
+   {
+      char logpath[MAX_PATH + 32];
+      FILE *fp;
+      snprintf(logpath, sizeof(logpath), "%s\\autoload.log", autoload_dir);
+      fp = fopen(logpath, "a");
+      if (fp) { fprintf(fp, "%s\n", line); fclose(fp); }
+   }
+}
+
+struct autoload_config
+{
+   bool enabled;
+   char save_path[MAX_PATH];
+   char state_ext[64];
+};
+
+static void autoload_trim(char *s)
+{
+   size_t len;
+   char  *start = s;
+   while (*start == ' ' || *start == '\t') start++;
+   if (start != s) memmove(s, start, strlen(start) + 1);
+   len = strlen(s);
+   while (len > 0 && (s[len-1] == '\r' || s[len-1] == '\n' ||
+                      s[len-1] == ' '  || s[len-1] == '\t'))
+      s[--len] = '\0';
+}
+
+static bool autoload_read_config(const char *cfg_path, autoload_config *cfg)
+{
+   FILE *fp;
+   char  line[1024];
+
+   cfg->enabled      = false;
+   cfg->save_path[0] = '\0';
+   strcpy(cfg->state_ext, "state.auto");
+
+   fp = fopen(cfg_path, "r");
+   if (!fp)
+      return false;
+
+   while (fgets(line, sizeof(line), fp))
+   {
+      char *eq, *key, *val;
+      if (line[0] == '#' || line[0] == ';')
+         continue;
+      eq = strchr(line, '=');
+      if (!eq)
+         continue;
+      *eq = '\0';
+      key = line;
+      val = eq + 1;
+      autoload_trim(key);
+      autoload_trim(val);
+
+      if (_stricmp(key, "enabled") == 0)
+         cfg->enabled = (_stricmp(val, "1")    == 0 ||
+                         _stricmp(val, "true") == 0 ||
+                         _stricmp(val, "yes")  == 0 ||
+                         _stricmp(val, "on")   == 0);
+      else if (_stricmp(key, "save_path") == 0)
+      {
+         strncpy(cfg->save_path, val, sizeof(cfg->save_path) - 1);
+         cfg->save_path[sizeof(cfg->save_path) - 1] = '\0';
+      }
+      else if (_stricmp(key, "state_ext") == 0)
+      {
+         if (*val == '.') val++;
+         if (*val)
+         {
+            strncpy(cfg->state_ext, val, sizeof(cfg->state_ext) - 1);
+            cfg->state_ext[sizeof(cfg->state_ext) - 1] = '\0';
+         }
+      }
+   }
+   fclose(fp);
+   return true;
+}
+
+/* ROM file name, no directory, no extension. Handles archive content
+ * passed as "<archive>.zip#<inner-file>.bin" by using the inner name. */
+static void autoload_rom_basename(char *out, size_t out_size)
+{
+   const char *p    = autoload_rom_path;
+   const char *hash = strrchr(p, '#');
+   const char *base, *s1, *s2;
+   char *dot;
+   if (hash)
+      p = hash + 1;
+   base = p;
+   s1   = strrchr(p, '\\');
+   s2   = strrchr(p, '/');
+   if (s1 && (!s2 || s1 > s2)) base = s1 + 1;
+   else if (s2)                base = s2 + 1;
+   strncpy(out, base, out_size - 1);
+   out[out_size - 1] = '\0';
+   dot = strrchr(out, '.');
+   if (dot) *dot = '\0';
+}
+
+/* RetroArch wraps states in a "RASTATE" container; the real data is in the
+ * "MEM " block. Returns true if it's a container, false to use file as-is.
+ * (FBNeo's retro_unserialize reads the buffer directly, so feeding it the
+ *  raw RASTATE header would corrupt the load - unwrapping is required.)    */
+static bool autoload_extract_rastate(const unsigned char *file, size_t file_len,
+                                     const unsigned char **out_data, size_t *out_size)
+{
+   size_t pos;
+   if (file_len < 8 || memcmp(file, "RASTATE", 7) != 0)
+      return false;
+   pos = 8;
+   while (pos + 8 <= file_len)
+   {
+      const unsigned char *p = file + pos;
+      unsigned int blocksize =  (unsigned int)p[4]
+                             | ((unsigned int)p[5] << 8)
+                             | ((unsigned int)p[6] << 16)
+                             | ((unsigned int)p[7] << 24);
+      pos += 8;
+      if (memcmp(p, "MEM ", 4) == 0)
+      {
+         if (pos + blocksize > file_len) return false;
+         *out_data = file + pos;
+         *out_size = (size_t)blocksize;
+         return true;
+      }
+      if (memcmp(p, "END ", 4) == 0)
+         break;
+      pos += blocksize;
+   }
+   return false;
+}
+
+static void autoload_try_load_state(void)
+{
+   autoload_config cfg;
+   char            cfg_path[MAX_PATH];
+   char            romname[MAX_PATH];
+   char            file[MAX_PATH * 3];
+   void           *buf        = NULL;
+   int64_t         len        = 0;
+   size_t          expected   = retro_serialize_size();
+   const unsigned char *state_data = NULL;
+   size_t          state_size = 0;
+   size_t          plen;
+
+   autoload_get_self_dir(autoload_dir, sizeof(autoload_dir));
+   if (autoload_dir[0] == '\0')
+   {
+      if (log_cb)
+         log_cb(RETRO_LOG_WARN,
+               "[autoload] could not resolve core .dll directory\n");
+      return;
+   }
+
+   autoload_logf("--- autoload run ---");
+   autoload_logf("dll directory : %s", autoload_dir);
+
+   autoload_get_self_cfg(cfg_path, sizeof(cfg_path));
+   autoload_logf("config file   : %s", cfg_path);
+
+   if (!autoload_read_config(cfg_path, &cfg))
+   {
+      autoload_logf("RESULT        : config file not found - nothing loaded");
+      return;
+   }
+   if (!cfg.enabled)
+   {
+      autoload_logf("RESULT        : disabled in config (enabled=0)");
+      return;
+   }
+   if (cfg.save_path[0] == '\0')
+   {
+      autoload_logf("RESULT        : save_path is empty in config");
+      return;
+   }
+   if (autoload_rom_path[0] == '\0')
+   {
+      autoload_logf("RESULT        : ROM path unknown (frontend gave none)");
+      return;
+   }
+
+   autoload_rom_basename(romname, sizeof(romname));
+   autoload_logf("rom path      : %s", autoload_rom_path);
+
+   plen = strlen(cfg.save_path);
+   while (plen > 0 && (cfg.save_path[plen-1] == '\\' ||
+                       cfg.save_path[plen-1] == '/'))
+      cfg.save_path[--plen] = '\0';
+
+   snprintf(file, sizeof(file), "%s\\%s.%s",
+            cfg.save_path, romname, cfg.state_ext);
+
+   autoload_logf("rom name      : %s", romname);
+   autoload_logf("state ext     : %s", cfg.state_ext);
+   autoload_logf("looking for   : %s", file);
+   autoload_logf("core expects  : %u bytes", (unsigned)expected);
+
+   if (!filestream_read_file(file, &buf, &len))
+   {
+      autoload_logf("RESULT        : state file not found or unreadable");
+      return;
+   }
+
+   autoload_logf("file size     : %d bytes", (int)len);
+
+   if (buf && len > 0)
+   {
+      if (autoload_extract_rastate((const unsigned char*)buf, (size_t)len,
+                                   &state_data, &state_size))
+         autoload_logf("RASTATE       : container detected, MEM block = %u bytes",
+                       (unsigned)state_size);
+      else
+      {
+         state_data = (const unsigned char*)buf;
+         state_size = (size_t)len;
+         autoload_logf("RASTATE       : not a container, using raw file");
+      }
+
+      if (state_size != expected)
+         autoload_logf("WARNING       : state is %u bytes but core expects %u "
+                       "(wrong ROM, or RetroArch 'Save State Compression' is ON "
+                       "- turn it OFF and re-save).",
+                       (unsigned)state_size, (unsigned)expected);
+
+      if (retro_unserialize(state_data, state_size))
+         autoload_logf("RESULT        : state loaded OK");
+      else
+         autoload_logf("RESULT        : retro_unserialize() refused the data");
+   }
+   else
+      autoload_logf("RESULT        : file was empty");
+
+   if (buf)
+      free(buf);
+}
+#endif
+
 void retro_run()
 {
 	bool bEnableVideo  = true;
 	bool bEmulateAudio = true;
 	bool bPresentAudio = true;
+
+#ifdef _WIN32
+	if (autoload_state_pending)
+	{
+		autoload_state_pending = false;
+		autoload_try_load_state();
+	}
+#endif
 
 	if (gui_show && nGameWidth > 0 && nGameHeight > 0)
 	{
@@ -2464,7 +2795,22 @@ bool retro_load_game(const struct retro_game_info *info)
 		extract_basename(g_driver_name, szRomsetPath, sizeof(g_driver_name), prefix);
 	}
 
+#ifdef _WIN32
+	autoload_rom_path[0] = '\0';
+	if (info && info->path)
+	{
+		strncpy(autoload_rom_path, info->path, sizeof(autoload_rom_path) - 1);
+		autoload_rom_path[sizeof(autoload_rom_path) - 1] = '\0';
+	}
+	{
+		bool autoload_loaded_ok = retro_load_game_common();
+		if (autoload_loaded_ok)
+			autoload_state_pending = true;
+		return autoload_loaded_ok;
+	}
+#else
 	return retro_load_game_common();
+#endif
 }
 
 bool retro_load_game_special(unsigned game_type, const struct retro_game_info *info, size_t)
