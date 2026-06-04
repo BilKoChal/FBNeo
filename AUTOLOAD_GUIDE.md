@@ -29,6 +29,9 @@ RetroArch Android, which uses ARM `.so` cores).
    - reads that file, unwraps RetroArch's **RASTATE** container if present,
    - and calls `retro_unserialize()` with the result.
 3. Every step is written to `autoload.log` next to the `.dll` for debugging.
+   This log is **shared by every core in that folder** (each run line is
+   tagged `core=<name>` and timestamped), and it is **trimmed to the latest
+   25 runs** at the start of each run so it never grows without bound.
 
 Config file (`fbneo_libretro.cfg`, placed beside the `.dll`):
 
@@ -42,6 +45,26 @@ FBNeo arcade ROMs are zips, so for `mslug.zip` the core loads
 `<save_path>\mslug.state.auto`.
 
 ---
+
+## 1b. Multiple save folders (multi-system cores)
+
+You can list **several `save_path` lines** in the config. The core tries
+them top-to-bottom and loads the **first folder that contains a matching
+state file**. This is for multi-system cores that keep states in per-system
+folders, e.g.:
+
+```ini
+enabled   = 1
+save_path = G:\RetroBat\saves\mastersystem\libretro.genesis_plus_gx
+save_path = G:\RetroBat\saves\megadrive\libretro.genesis_plus_gx
+state_ext = state.auto
+```
+
+In `autoload.log` each attempt shows as a `trying :` line, and the one that
+matched shows as `found in :`. Up to 16 paths are supported. In the code this
+is the `save_paths[]` array in `autoload_config` plus the search loop in
+`autoload_try_load_state()` - both are inside the self-contained block, so
+copying the block verbatim brings the feature along.
 
 ## 2. The three code changes
 

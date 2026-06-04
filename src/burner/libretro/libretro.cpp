@@ -1471,6 +1471,10 @@ static void VideoBufferInit()
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
+#include <time.h>
+
+#define AUTOLOAD_MAX_RUNS 25   /* keep only the latest N runs in autoload.log */
+#define AUTOLOAD_MAX_PATHS 16  /* max number of save_path entries in the config */
 
 #ifndef MAX_PATH
 #define MAX_PATH 260
@@ -1491,6 +1495,7 @@ unsigned long __stdcall GetModuleFileNameA(void *hModule,
 static bool autoload_state_pending      = false;
 static char autoload_dir[MAX_PATH]      = {0};
 static char autoload_rom_path[MAX_PATH] = {0};
+static char autoload_core_name[64]      = {0};
 
 static void autoload_get_self_dir(char *out, size_t out_size)
 {
@@ -1507,6 +1512,25 @@ static void autoload_get_self_dir(char *out, size_t out_size)
    if (slash) *slash = '\0';
    strncpy(out, path, out_size - 1);
    out[out_size - 1] = '\0';
+}
+
+static void autoload_get_self_name(char *out, size_t out_size)
+{
+   void *hm = NULL;
+   char  path[MAX_PATH];
+   char *slash, *dot, *base;
+   out[0] = '\0';
+   if (!GetModuleHandleExA(AUTOLOAD_FROM_ADDRESS | AUTOLOAD_UNCHANGED_REFCOUNT,
+                           (const char*)&autoload_get_self_name, &hm))
+      return;
+   if (!GetModuleFileNameA(hm, path, sizeof(path)))
+      return;
+   slash = strrchr(path, '\\');
+   base  = slash ? slash + 1 : path;
+   strncpy(out, base, out_size - 1);
+   out[out_size - 1] = '\0';
+   dot = strrchr(out, '.');
+   if (dot) *dot = '\0';
 }
 
 static void autoload_get_self_cfg(char *out, size_t out_size)
@@ -1548,10 +1572,59 @@ static void autoload_logf(const char *fmt, ...)
    }
 }
 
+/* Trim autoload.log so it keeps only the most recent `keep_runs` runs.
+ * Runs are delimited by lines beginning with "--- autoload run ---". */
+static void autoload_log_rotate(int keep_runs)
+{
+   char        logpath[MAX_PATH + 32];
+   const char *marker = "--- autoload run ---";
+   FILE       *fp;
+   long        fsize;
+   char       *data, *p, *cut;
+   int         count = 0, seen = 0;
+   size_t      got;
+
+   if (autoload_dir[0] == '\0')
+      return;
+   snprintf(logpath, sizeof(logpath), "%s\\autoload.log", autoload_dir);
+
+   fp = fopen(logpath, "rb");
+   if (!fp)
+      return;
+   fseek(fp, 0, SEEK_END);
+   fsize = ftell(fp);
+   fseek(fp, 0, SEEK_SET);
+   if (fsize <= 0) { fclose(fp); return; }
+   data = (char*)malloc((size_t)fsize + 1);
+   if (!data) { fclose(fp); return; }
+   got = fread(data, 1, (size_t)fsize, fp);
+   data[got] = '\0';
+   fclose(fp);
+
+   p = data;
+   while ((p = strstr(p, marker)) != NULL) { count++; p += 1; }
+
+   if (count > keep_runs)
+   {
+      int drop = count - keep_runs;
+      cut = data;
+      p   = data;
+      while ((p = strstr(p, marker)) != NULL)
+      {
+         if (++seen == drop + 1) { cut = p; break; }
+         p += 1;
+      }
+      fp = fopen(logpath, "wb");
+      if (fp) { fwrite(cut, 1, strlen(cut), fp); fclose(fp); }
+   }
+   free(data);
+}
+
 struct autoload_config
 {
    bool enabled;
-   char save_path[MAX_PATH];
+   int  num_paths;
+   char save_paths[AUTOLOAD_MAX_PATHS][MAX_PATH];
    char state_ext[64];
 };
 
@@ -1573,7 +1646,7 @@ static bool autoload_read_config(const char *cfg_path, autoload_config *cfg)
    char  line[1024];
 
    cfg->enabled      = false;
-   cfg->save_path[0] = '\0';
+   cfg->num_paths    = 0;
    strcpy(cfg->state_ext, "state.auto");
 
    fp = fopen(cfg_path, "r");
@@ -1601,8 +1674,12 @@ static bool autoload_read_config(const char *cfg_path, autoload_config *cfg)
                          _stricmp(val, "on")   == 0);
       else if (_stricmp(key, "save_path") == 0)
       {
-         strncpy(cfg->save_path, val, sizeof(cfg->save_path) - 1);
-         cfg->save_path[sizeof(cfg->save_path) - 1] = '\0';
+         if (cfg->num_paths < AUTOLOAD_MAX_PATHS && *val)
+         {
+            strncpy(cfg->save_paths[cfg->num_paths], val, MAX_PATH - 1);
+            cfg->save_paths[cfg->num_paths][MAX_PATH - 1] = '\0';
+            cfg->num_paths++;
+         }
       }
       else if (_stricmp(key, "state_ext") == 0)
       {
@@ -1694,7 +1771,17 @@ static void autoload_try_load_state(void)
       return;
    }
 
-   autoload_logf("--- autoload run ---");
+   autoload_get_self_name(autoload_core_name, sizeof(autoload_core_name));
+   autoload_log_rotate(AUTOLOAD_MAX_RUNS - 1);
+
+   {
+      time_t     t  = time(NULL);
+      struct tm *lt = localtime(&t);
+      char       ts[32];
+      if (lt) strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", lt);
+      else    ts[0] = '\0';
+      autoload_logf("--- autoload run --- core=%s  %s", autoload_core_name, ts);
+   }
    autoload_logf("dll directory : %s", autoload_dir);
 
    autoload_get_self_cfg(cfg_path, sizeof(cfg_path));
@@ -1710,9 +1797,9 @@ static void autoload_try_load_state(void)
       autoload_logf("RESULT        : disabled in config (enabled=0)");
       return;
    }
-   if (cfg.save_path[0] == '\0')
+   if (cfg.num_paths == 0)
    {
-      autoload_logf("RESULT        : save_path is empty in config");
+      autoload_logf("RESULT        : no save_path in config");
       return;
    }
    if (autoload_rom_path[0] == '\0')
@@ -1723,24 +1810,37 @@ static void autoload_try_load_state(void)
 
    autoload_rom_basename(romname, sizeof(romname));
    autoload_logf("rom path      : %s", autoload_rom_path);
-
-   plen = strlen(cfg.save_path);
-   while (plen > 0 && (cfg.save_path[plen-1] == '\\' ||
-                       cfg.save_path[plen-1] == '/'))
-      cfg.save_path[--plen] = '\0';
-
-   snprintf(file, sizeof(file), "%s\\%s.%s",
-            cfg.save_path, romname, cfg.state_ext);
-
    autoload_logf("rom name      : %s", romname);
    autoload_logf("state ext     : %s", cfg.state_ext);
-   autoload_logf("looking for   : %s", file);
    autoload_logf("core expects  : %u bytes", (unsigned)expected);
 
-   if (!filestream_read_file(file, &buf, &len))
+   /* Try each save_path in order; the first folder that has a matching
+    * state file wins (handy for multi-system cores). */
    {
-      autoload_logf("RESULT        : state file not found or unreadable");
-      return;
+      int  i;
+      bool found = false;
+      for (i = 0; i < cfg.num_paths; i++)
+      {
+         char *sp = cfg.save_paths[i];
+         while ((plen = strlen(sp)) > 0 &&
+                (sp[plen-1] == '\\' || sp[plen-1] == '/'))
+            sp[plen-1] = '\0';
+
+         snprintf(file, sizeof(file), "%s\\%s.%s", sp, romname, cfg.state_ext);
+         autoload_logf("trying        : %s", file);
+
+         if (filestream_read_file(file, &buf, &len))
+         {
+            autoload_logf("found in      : %s", sp);
+            found = true;
+            break;
+         }
+      }
+      if (!found)
+      {
+         autoload_logf("RESULT        : no matching state file in any save_path");
+         return;
+      }
    }
 
    autoload_logf("file size     : %d bytes", (int)len);
