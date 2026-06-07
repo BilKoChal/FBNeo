@@ -19,6 +19,10 @@
 #
 # The -ldl flag links libdl which provides dladdr() used by the
 # autoload block to locate the core's own .so/.dll path at runtime.
+#
+# The -static-libstdc++ flag in the Android build statically links libc++
+# so the core won't depend on libc++_shared.so at runtime. Without it,
+# dlopen fails with "library libc++_shared.so not found" on Android.
 
 name: Build FBNeo autostate
 
@@ -183,6 +187,11 @@ jobs:
   # script from SHARED (Android linker does not support it).           #
   # -ldl links libdl which provides dladdr() used by the autoload      #
   # block to locate the core's own .so path at runtime.                #
+  # -static-libstdc++ statically links libc++ so the core won't       #
+  # depend on libc++_shared.so at runtime. Without this flag, the     #
+  # resulting .so requires libc++_shared.so which is not available    #
+  # on most Android devices when loading libretro cores, causing      #
+  # dlopen to fail with "library libc++_shared.so not found".         #
   # ------------------------------------------------------------------ #
   build-android:
     name: Android ${{ matrix.abi }}
@@ -234,6 +243,9 @@ jobs:
           # platform=unix sets TARGET=fbneo_libretro.so and fpic=-fPIC
           # We override SHARED: Android linker doesn't support --version-script
           # -ldl is essential for dladdr() used by autoload self-detection
+          # -static-libstdc++ statically links libc++ into the .so so it
+          #   won't depend on libc++_shared.so at runtime (which is missing
+          #   on most Android devices when loading libretro cores).
           cd src/burner/libretro
           make -f Makefile \
             platform=unix \
@@ -243,7 +255,7 @@ jobs:
             RANLIB="$RANLIB" \
             STRIP="$STRIP" \
             SHARED="-shared -fPIC" \
-            LDFLAGS="-ldl" \
+            LDFLAGS="-ldl -static-libstdc++" \
             -j$(nproc)
 
       - name: Stage artifact
