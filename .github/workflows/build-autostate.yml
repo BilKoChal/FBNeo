@@ -1,0 +1,257 @@
+# .github/workflows/build-autostate.yml
+#
+# Builds the patched fbneo_libretro core for:
+#   • Windows 64-bit  (MinGW cross-compile on Ubuntu)
+#   • Windows 32-bit  (MinGW cross-compile on Ubuntu)
+#   • Linux 64-bit
+#   • macOS (Intel + Apple Silicon universal)
+#   • Android arm64-v8a
+#   • Android armeabi-v7a
+#   • Android x86_64
+#
+# Artifacts are uploaded so you can download them directly from the
+# GitHub Actions run page without needing a release.
+#
+# Trigger: every push and pull-request, plus manual dispatch.
+#
+# NOTE: FBNeo is huge — a full build takes roughly 45–90 minutes per arch.
+# That is well within the GitHub Actions job limit; just be patient.
+#
+# The -ldl flag links libdl which provides dladdr() used by the
+# autoload block to locate the core's own .so/.dll path at runtime.
+
+name: Build FBNeo autostate
+
+on:
+  push:
+    branches: [ "**" ]
+    tags: [ "v*" ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  # ------------------------------------------------------------------ #
+  # Windows 64-bit (MinGW cross-compile)                               #
+  # ------------------------------------------------------------------ #
+  build-win64:
+    name: Windows x64 (MinGW)
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install MinGW-w64 toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            gcc-mingw-w64-x86-64 \
+            g++-mingw-w64-x86-64 \
+            make
+
+      - name: Build
+        run: |
+          cd src/burner/libretro
+          make -f Makefile \
+               platform=win \
+               CC=x86_64-w64-mingw32-gcc \
+               CXX=x86_64-w64-mingw32-g++ \
+               -j$(nproc)
+
+      - name: Stage artifact
+        run: |
+          mkdir -p dist
+          cp src/burner/libretro/fbneo_libretro.dll dist/fbneo_libretro_win64.dll
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fbneo_libretro_win64
+          path: dist/fbneo_libretro_win64.dll
+
+      - name: Attach to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/fbneo_libretro_win64.dll
+
+  # ------------------------------------------------------------------ #
+  # Windows 32-bit (MinGW cross-compile)                               #
+  # ------------------------------------------------------------------ #
+  build-win32:
+    name: Windows x86 (MinGW)
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install MinGW-w64 toolchain (32-bit)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            gcc-mingw-w64-i686 \
+            g++-mingw-w64-i686 \
+            make
+
+      - name: Build
+        run: |
+          cd src/burner/libretro
+          make -f Makefile \
+               platform=win \
+               CC=i686-w64-mingw32-gcc \
+               CXX=i686-w64-mingw32-g++ \
+               -j$(nproc)
+
+      - name: Stage artifact
+        run: |
+          mkdir -p dist
+          cp src/burner/libretro/fbneo_libretro.dll dist/fbneo_libretro_win32.dll
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fbneo_libretro_win32
+          path: dist/fbneo_libretro_win32.dll
+
+  # ------------------------------------------------------------------ #
+  # Linux 64-bit                                                       #
+  # ------------------------------------------------------------------ #
+  build-linux64:
+    name: Linux x64
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            make
+
+      - name: Build
+        run: |
+          cd src/burner/libretro
+          make -f Makefile \
+               platform=unix \
+               LDFLAGS="-ldl" \
+               -j$(nproc)
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fbneo_libretro_linux64
+          path: src/burner/libretro/fbneo_libretro.so
+
+  # ------------------------------------------------------------------ #
+  # macOS (Intel + Apple Silicon universal)                            #
+  # ------------------------------------------------------------------ #
+  build-macos:
+    name: macOS Universal
+    runs-on: macos-latest
+    timeout-minutes: 180
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build
+        run: |
+          cd src/burner/libretro
+          make -f Makefile \
+               platform=osx \
+               UNIVERSAL=1 \
+               ARCHFLAGS="-arch x86_64 -arch arm64" \
+               -j$(sysctl -n hw.ncpu)
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fbneo_libretro_macos
+          path: src/burner/libretro/fbneo_libretro.dylib
+
+  # ------------------------------------------------------------------ #
+  # Android — arm64-v8a / armeabi-v7a / x86_64                        #
+  #                                                                    #
+  # The FBNeo Makefile uses platform=unix for Android NDK cross-       #
+  # compile. We override CC/CXX with NDK Clang and drop the version-  #
+  # script from SHARED (Android linker does not support it).           #
+  # -ldl links libdl which provides dladdr() used by the autoload      #
+  # block to locate the core's own .so path at runtime.                #
+  # ------------------------------------------------------------------ #
+  build-android:
+    name: Android ${{ matrix.abi }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - abi: arm64-v8a
+            ndk_target: aarch64-linux-android
+            artifact_suffix: android_arm64-v8a
+
+          - abi: armeabi-v7a
+            ndk_target: armv7a-linux-androideabi
+            artifact_suffix: android_armeabi-v7a
+
+          - abi: x86_64
+            ndk_target: x86_64-linux-android
+            artifact_suffix: android_x86_64
+
+    env:
+      ANDROID_API: 21
+      NDK_VERSION: "26.3.11579264"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install NDK
+        run: |
+          yes | ${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager \
+            "ndk;${{ env.NDK_VERSION }}" 2>&1 | tail -3
+          echo "NDK_ROOT=${ANDROID_HOME}/ndk/${{ env.NDK_VERSION }}" >> $GITHUB_ENV
+
+      - name: Install make
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends make
+
+      - name: Build
+        run: |
+          TOOLCHAIN=${NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64
+          CC="${TOOLCHAIN}/bin/${{ matrix.ndk_target }}${{ env.ANDROID_API }}-clang"
+          CXX="${TOOLCHAIN}/bin/${{ matrix.ndk_target }}${{ env.ANDROID_API }}-clang++"
+          AR="${TOOLCHAIN}/bin/llvm-ar"
+          RANLIB="${TOOLCHAIN}/bin/llvm-ranlib"
+          STRIP="${TOOLCHAIN}/bin/llvm-strip"
+
+          # platform=unix sets TARGET=fbneo_libretro.so and fpic=-fPIC
+          # We override SHARED: Android linker doesn't support --version-script
+          # -ldl is essential for dladdr() used by autoload self-detection
+          cd src/burner/libretro
+          make -f Makefile \
+            platform=unix \
+            CC="$CC" \
+            CXX="$CXX" \
+            AR="$AR" \
+            RANLIB="$RANLIB" \
+            STRIP="$STRIP" \
+            SHARED="-shared -fPIC" \
+            LDFLAGS="-ldl" \
+            -j$(nproc)
+
+      - name: Stage artifact
+        run: |
+          cp src/burner/libretro/fbneo_libretro.so fbneo_libretro_${{ matrix.artifact_suffix }}.so
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fbneo_libretro_${{ matrix.artifact_suffix }}
+          path: fbneo_libretro_${{ matrix.artifact_suffix }}.so
