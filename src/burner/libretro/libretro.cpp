@@ -1507,6 +1507,7 @@ unsigned long __stdcall GetModuleFileNameA(void *hModule,
 #endif
 
 static bool autoload_state_pending      = false;
+static bool autoload_hotkey_pending     = false;  /* Num1 pressed → reset + autoload */
 static char autoload_dir[AUTOLOAD_MAX_PATH]      = {0};   /* folder the core lives in */
 static char autoload_rom_path[AUTOLOAD_MAX_PATH] = {0};   /* full path of the loaded ROM   */
 static char autoload_core_name[64]      = {0};   /* this core's file name, no ext */
@@ -1927,6 +1928,24 @@ void retro_run()
         {
                 autoload_state_pending = false;
                 autoload_try_load_state();
+        }
+
+        /* ---- Hotkey: Numpad 1 → reset game + autoload save state ---- */
+        if (autoload_hotkey_pending)
+        {
+                autoload_hotkey_pending = false;
+                autoload_logf("HOTKEY        : Num1 pressed — resetting game + autoload");
+                retro_reset();
+                autoload_state_pending = true;
+                /* autoload_try_load_state() will run on the next frame */
+                return;
+        }
+        {
+                static bool num1_was_pressed = false;
+                bool num1_is_pressed = input_cb(0, RETRO_DEVICE_KEYBOARD, 0, RETROK_KP1);
+                if (num1_is_pressed && !num1_was_pressed && autoload_rom_path[0] != '\0')
+                        autoload_hotkey_pending = true;
+                num1_was_pressed = num1_is_pressed;
         }
 
         if (gui_show && nGameWidth > 0 && nGameHeight > 0)
